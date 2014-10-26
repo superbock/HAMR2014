@@ -58,7 +58,7 @@ class ConductionTracking(object):
         self.path = None
         self.bar_start_positions = None
 
-    def track(self, num_beat_states=NUM_BEAT_STATES,
+    def track(self, num_bar_states=NUM_BEAT_STATES,
               min_bpm=MIN_BPM, max_bpm=MAX_BPM, gmm_model=GMM_MODEL,
               tempo_change_probability=TEMPO_CHANGE_PROBABILITY,
               norm_observations=NORM_OBSERVATIONS):
@@ -67,7 +67,7 @@ class ConductionTracking(object):
 
         Parameters for the transition model:
 
-        :param num_beat_states:          number of cells for one beat period
+        :param num_bar_states:           number of cells for one beat period
         :param tempo_change_probability: probability of a tempo change between
                                          two adjacent observations
         :param min_bpm:                  minimum tempo used for beat tracking
@@ -83,22 +83,22 @@ class ConductionTracking(object):
 
         """
         # convert timing information to tempo spaces
-        max_tempo = int(np.ceil(max_bpm * num_beat_states / (60. * self.fps)))
-        min_tempo = int(np.floor(min_bpm * num_beat_states / (60. * self.fps)))
+        max_tempo = int(np.ceil(max_bpm * num_bar_states / (60. * self.fps)))
+        min_tempo = int(np.floor(min_bpm * num_bar_states / (60. * self.fps)))
         tempo_states = np.arange(min_tempo, max_tempo)
         print tempo_states
         # transition model
-        tm = TransitionModel(num_beat_states=num_beat_states,
+        tm = TransitionModel(num_bar_states=num_bar_states,
                              tempo_states=tempo_states,
                              tempo_change_probability=tempo_change_probability)
         # observation model
         om = ObservationModel(gmm_model, self.features,
                               num_states=tm.num_states,
-                              num_beat_states=tm.num_beat_states,
+                              num_bar_states=tm.num_bar_states,
                               norm_observations=norm_observations)
         # init the DBN
         dbn = DBN(transition_model=tm, observation_model=om)
-        # convert the detected beats to a list of timestamps
+        # save some information (mainly for visualisation)
         self.densities = om.densities.astype(np.float)
         self.path = dbn.bar_states_path.astype(np.int)
         self.bar_start_positions = argrelmin(self.path, mode='wrap')[0] / \
@@ -108,17 +108,18 @@ class ConductionTracking(object):
 
     def write(self, filename):
         """
-        Write the detected start positions to a file.
+        Write the detected bar start positions to a file.
 
         :param filename: output file name or file handle
 
         """
+        # open file if needed
         if isinstance(filename, basestring):
             f = fid = open(filename, 'w')
         else:
             f = filename
             fid = None
-        # yield an open file handle
+        # write the start positions
         f.writelines('%g\n' % e for e in self.bar_start_positions)
         # close the file if needed
         if fid:
@@ -213,7 +214,7 @@ cdef class TransitionModel(object):
     # hidden list with attributes to save/load
     cdef list attributes
     # define some variables which are also exported as Python attributes
-    cdef public unsigned int num_beat_states
+    cdef public unsigned int num_bar_states
     cdef public np.ndarray tempo_states
     cdef public double tempo_change_probability
 
@@ -281,7 +282,7 @@ cdef class TransitionModel(object):
         cdef int i = 0
         # loop over all states
         for state in range(num_states):
-            # position inside beat & tempo
+            # position inside bar & tempo
             bar_state = state % num_bar_states
             tempo_state = state / num_bar_states
             tempo = tempo_states[tempo_state]
@@ -352,7 +353,7 @@ cdef class ObservationModel(object):
     # define some variables which are also exported as Python attributes
     cdef public np.ndarray densities
     cdef public np.ndarray pointers
-    # default values for beat tracking
+    # default values for conduction tracking
     NORM_OBSERVATIONS = True
 
     def __init__(self, model, activations, num_states, num_bar_states,
