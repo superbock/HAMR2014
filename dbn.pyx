@@ -182,6 +182,11 @@ cdef class TransitionModel(object):
         # return the arrays
         return probabilities, states, prev_states
 
+    @property
+    def num_states(self):
+        """Number of states."""
+        return len(self.pointers) - 1
+
 
 cdef class ObservationModel(object):
     """
@@ -202,6 +207,9 @@ cdef class ObservationModel(object):
     # define some variables which are also exported as Python attributes
     cdef public np.ndarray densities
     cdef public np.ndarray pointers
+    cdef public np.ndarray observations
+    cdef public list gmms
+    cdef public bint norm_observations
     # default values
     NORM_OBSERVATIONS = False
     LOG_PROBABILITY = False
@@ -209,7 +217,7 @@ cdef class ObservationModel(object):
     MIN_PROBABILITY = 0.
     MAX_PROBABILITY = 1.
 
-    def __init__(self, model, activations, num_states, num_bar_states,
+    def __init__(self, model, observations, num_states, num_bar_states,
                  norm_observations=NORM_OBSERVATIONS,
                  log_probability=LOG_PROBABILITY,
                  norm_probability=NORM_PROBABILITY,
@@ -221,7 +229,7 @@ cdef class ObservationModel(object):
 
         :param model:             load the fitted GMM(s) of the observation
                                   model from the given file
-        :param activations:       time sequence of feature values
+        :param observations:      time sequence of observed feature values
         :param num_states:        number of DBN states
         :param num_bar_states:    number of DBN bar states
         :param norm_observations: normalise the observations
@@ -238,19 +246,20 @@ cdef class ObservationModel(object):
                 self.gmms = cPickle.load(f)
         else:
             raise ValueError('model must be given')
-        # convert the given activations to an contiguous array
-        self.activations = np.ascontiguousarray(activations, dtype=np.float)
-        # normalise the activations
+        # convert the given observations to an contiguous array
+        self.observations = np.ascontiguousarray(observations, dtype=np.float)
+        # normalise the observations
         if norm_observations:
-            self.activations /= np.max(self.activations)
+            self.observations /= np.max(self.observations)
         # save the given parameters
         self.norm_observations = norm_observations
         # generate the observation model
-        self.observation_model(self.activations, num_states, num_bar_states,
-                               log_probability, norm_probability,
-                               min_probability,max_probability)
+        self.observation_model(self.observations, num_states, num_bar_states,
+                               norm_observations, log_probability,
+                               norm_probability, min_probability,
+                               max_probability)
 
-    def observation_model(self, activations, num_states, num_bar_states,
+    def observation_model(self, observations, num_states, num_bar_states,
                           norm_observations=NORM_OBSERVATIONS,
                           log_probability=LOG_PROBABILITY,
                           norm_probability=NORM_PROBABILITY,
@@ -259,7 +268,7 @@ cdef class ObservationModel(object):
         """
         Compute the observation probability densities using (a) GMM(s).
 
-        :param activations:       time sequence of feature values
+        :param observations:      time sequence of observed feature values
         :param num_states:        number of states
         :param num_bar_states:    number of bar states
         :param norm_observations: normalise the observations
@@ -270,7 +279,7 @@ cdef class ObservationModel(object):
 
         """
         # counter, etc.
-        num_observations = len(activations)
+        num_observations = len(observations)
         num_gmms = len(self.gmms)
         # init observation densities
         densities = np.zeros((num_observations, num_gmms), dtype=np.float)
@@ -279,13 +288,14 @@ cdef class ObservationModel(object):
             # get the predictions of each GMM for the activations
             # Note: the GMMs return weird probabilities, at least exp(p) is
             #       somehow predictable, since it is > 0
-            densities[:, i] = np.exp(gmm.score(activations))
+            densities[:, i] = np.exp(gmm.score(observations))
         # scale the densities
         if log_probability:
             densities = np.log(densities + 1)
         if norm_probability:
             densities /= np.max(densities)
-        densities = np.maximum(max_probability * densities, min_probability)
+        densities = np.minimum(densities, max_probability)
+        densities = np.maximum(densities, min_probability)
 
         # init the observation pointers
         pointers = np.zeros(num_states, dtype=np.uint32)
@@ -351,6 +361,157 @@ cdef class DBN(object):
         else:
             self.initial_states = np.ascontiguousarray(initial_states,
                                                        dtype=np.float)
+    @cython.cdivision(True)
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    cdef inline void _best_prev_state(self, int state, int frame,
+                                      double [::1] current_viterbi,
+                                      double [::1] prev_viterbi,
+                                      double [:, ::1] om_densities,
+                                      unsigned int [::1] om_pointers,
+                                      unsigned int [::1] tm_states,
+                                      unsigned int [::1] tm_pointers,
+                                      double [::1] tm_probabilities,
+                                      unsigned int [:, ::1] pointers) nogil:
+        """
+        Inline function to determine the best previous state.
+
+        :param state:            current state
+        :param frame:            current frame
+        :param current_viterbi:  current viterbi variables
+        :param prev_viterbi:     previous viterbi variables
+        :param om_densities:     observation model densities
+        :param om_pointers:      observation model pointers
+        :param tm_states:        transition model states
+        :param tm_pointers:      transition model pointers
+        :param tm_probabilities: transition model probabilities
+        :param pointers:         back tracking pointers
+
+        """
+        # define variables
+        cdef unsigned int prev_state, pointer
+        cdef double density, transition_prob
+        # reset the current viterbi variable
+        current_viterbi[state] = 0.0
+        # get the observation model probability density value
+        # the om_pointers array holds pointers to the correct observation
+        # probability density value for the actual state (i.e. column in the
+        # om_densities array)
+        # Note: defining density here gives a 5% speed-up!?
+        density = om_densities[frame, om_pointers[state]]
+        # iterate over all possible previous states
+        # the tm_pointers array holds pointers to the states which are
+        # stored in the tm_states array
+        for pointer in range(tm_pointers[state], tm_pointers[state + 1]):
+            prev_state = tm_states[pointer]
+            # weight the previous state with the transition
+            # probability and the observation probability density
+            transition_prob = prev_viterbi[prev_state] * \
+                              tm_probabilities[pointer] * density
+            # if this transition probability is greater than the
+            # current, overwrite it and save the previous state
+            # in the current pointers
+            if transition_prob > current_viterbi[state]:
+                current_viterbi[state] = transition_prob
+                pointers[frame, state] = prev_state
+            # # forward pass only:
+            # current_viterbi[state] += transition_prob
+
+
+
+    @cython.cdivision(True)
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    def viterbi(self):
+        """
+        Determine the best path with the Viterbi algorithm.
+
+        :return: best state-space path sequence and its log probability
+
+        """
+        # transition model stuff
+        cdef TransitionModel tm = self.transition_model
+        cdef unsigned int [::1] tm_states = tm.states
+        cdef unsigned int [::1] tm_pointers = tm.pointers
+        cdef double [::1] tm_probabilities = tm.probabilities
+        cdef unsigned int num_states = tm.num_states
+
+        # observation model stuff
+        cdef ObservationModel om = self.observation_model
+        cdef double [:, ::1] om_densities = om.densities
+        cdef unsigned int [::1] om_pointers = om.pointers
+        cdef unsigned int num_observations = len(om.densities)
+
+        # current viterbi variables
+        current_viterbi_np = np.empty(num_states, dtype=np.float)
+        cdef double [::1] current_viterbi = current_viterbi_np
+
+        # previous viterbi variables, init with the initial state distribution
+        cdef double [::1] previous_viterbi = self.initial_states
+
+        # back-tracking pointers
+        cdef unsigned int [:, ::1] bt_pointers = np.empty((num_observations,
+                                                           num_states),
+                                                          dtype=np.uint32)
+        # back tracked path, a.k.a. path sequence
+        path = np.empty(num_observations, dtype=np.uint32)
+
+        # define counters etc.
+        cdef int state, frame
+        cdef unsigned int prev_state, pointer, num_threads = self.num_threads
+        cdef double obs, transition_prob, viterbi_sum, path_probability = 0.0
+
+        # iterate over all observations
+        for frame in range(num_observations):
+            # range() is faster than prange() for 1 thread
+            if num_threads == 1:
+                # search for best transitions sequentially
+                for state in range(num_states):
+                    self._best_prev_state(state, frame, current_viterbi,
+                                          previous_viterbi, om_densities,
+                                          om_pointers, tm_states, tm_pointers,
+                                          tm_probabilities, bt_pointers)
+            else:
+                # search for best transitions in parallel
+                for state in prange(num_states, nogil=True, schedule='static',
+                                    num_threads=num_threads):
+                    self._best_prev_state(state, frame, current_viterbi,
+                                          previous_viterbi, om_densities,
+                                          om_pointers, tm_states, tm_pointers,
+                                          tm_probabilities, bt_pointers)
+
+            # overwrite the old states with the normalized current ones
+            # Note: this is faster than unrolling the loop! But it is a bit
+            #       tricky: we need to do the summing and normalisation on the
+            #       numpy array but do the assignment on the memoryview
+            viterbi_sum = current_viterbi_np.sum()
+            previous_viterbi = current_viterbi_np / viterbi_sum
+            # add the log sum of all viterbi variables to the overall sum
+            path_probability += log(viterbi_sum)
+
+        # fetch the final best state
+        state = current_viterbi_np.argmax()
+        # add its log probability to the sum
+        path_probability += log(current_viterbi_np.max())
+        # track the path backwards, start with the last frame and do not
+        # include the pointer for frame 0, since it includes the transitions
+        # to the prior distribution states
+        for frame in range(num_observations -1, -1, -1):
+            # save the state in the path
+            path[frame] = state
+            # fetch the next previous one
+            state = bt_pointers[frame, state]
+        # save the tracked path and log sum and return them
+        self._path = path
+        self.path_probability = path_probability
+        return path, path_probability
+
+    @property
+    def path(self):
+        """Best path sequence."""
+        if self._path is None:
+            self.viterbi()
+        return self._path
 
     @property
     def bar_states_path(self):

@@ -94,7 +94,6 @@ class ConductionTracking(object):
         max_tempo = int(np.ceil(max_bpm * num_bar_states / (60. * self.fps)))
         min_tempo = int(np.floor(min_bpm * num_bar_states / (60. * self.fps)))
         tempo_states = np.arange(min_tempo, max_tempo)
-        print tempo_states
         # transition model
         tm = TransitionModel(num_bar_states=num_bar_states,
                              tempo_states=tempo_states,
@@ -104,7 +103,7 @@ class ConductionTracking(object):
                               num_states=tm.num_states,
                               num_bar_states=tm.num_bar_states,
                               norm_observations=norm_observations,
-                              log_probability=False, norm_probability=False,
+                              log_probability=True, norm_probability=True,
                               min_probability=0.3, max_probability=0.7)
         # init the DBN
         dbn = DBN(transition_model=tm, observation_model=om)
@@ -190,9 +189,6 @@ def parser():
     p.add_argument('--version', action='version', version='ConductionTracker')
     # parse arguments
     args = p.parse_args()
-    # print arguments
-    if args.verbose:
-        print args
     # return
     return args
 
@@ -214,6 +210,8 @@ def main():
             norm_observations=args.norm_observations)
 
     # plot it
+    print t.densities.max()
+    print t.densities.min()
     import matplotlib.pyplot as plt
     plt.imshow(t.densities.T, aspect='auto', interpolation='none',
                origin='lower')
